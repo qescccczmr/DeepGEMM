@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_set>
+#include <vector>
 #include <deep_gemm/common/types.cuh>
 
 #include "config.hpp"
@@ -11,11 +12,10 @@
 namespace deep_gemm {
 
 template <typename ArchSpec>
-static GemmConfig get_best_config(const GemmDesc& desc) {
+static GemmConfig get_best_config_from_layout_candidates(const GemmDesc& desc, const std::vector<Layout>& layout_candidates) {
     desc.check_validity();
 
     // Choose the best layout
-    const auto layout_candidates = ArchSpec::get_layout_candidates(desc);
     DG_HOST_ASSERT(not layout_candidates.empty());
     auto layout = layout_candidates[0];
     auto layout_info = ArchSpec::get_layout_info(desc, layout);
@@ -49,6 +49,11 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
         }
     }
     return gemm_config;
+}
+
+template <typename ArchSpec>
+static GemmConfig get_best_config(const GemmDesc& desc) {
+    return get_best_config_from_layout_candidates<ArchSpec>(desc, ArchSpec::get_layout_candidates(desc));
 }
 
 } // namespace deep_gemm

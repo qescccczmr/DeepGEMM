@@ -7,11 +7,99 @@
 #include "common.hpp"
 #include "utils.hpp"
 #include "../../utils/exception.hpp"
+#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
+
+    static bool is_swap_ab_supported(const GemmDesc& desc) {
+        return desc.gemm_type == GemmType::MGroupedContiguous and
+               desc.kernel_type == KernelType::Kernel1D2D and
+               desc.a_dtype == torch::kFloat8_e4m3fn and
+               desc.b_dtype == torch::kFloat8_e4m3fn and
+               desc.cd_dtype == torch::kBFloat16 and
+               desc.major_a == cute::UMMA::Major::K and
+               desc.major_b == cute::UMMA::Major::K and
+               not desc.with_accumulation;
+    }
+
+    static bool is_normal_swap_ab_supported(const GemmDesc& desc) {
+        return desc.gemm_type == GemmType::Normal and
+               desc.kernel_type == KernelType::Kernel1D2D and
+               desc.a_dtype == torch::kFloat8_e4m3fn and
+               desc.b_dtype == torch::kFloat8_e4m3fn and
+               desc.cd_dtype == torch::kBFloat16 and
+               desc.major_a == cute::UMMA::Major::K and
+               desc.major_b == cute::UMMA::Major::K and
+               not desc.with_accumulation and
+               desc.get_expected_m() <= 128;
+    }
+
+    static std::vector<Layout> get_normal_swap_ab_layout_candidates(const GemmDesc& desc) {
+        if (not is_normal_swap_ab_supported(desc))
+            return {};
+
+        const int expected_m = desc.get_expected_m();
+        int block_m = expected_m <= 8 ? 8 :
+                      expected_m <= 16 ? 16 :
+                      expected_m <= 32 ? 32 :
+                      expected_m <= 64 ? 64 : 128;
+        int block_n = expected_m == 1 and desc.get_expected_n() == 4096 and desc.get_expected_k() >= 1024 ? 32 : 64;
+        int cluster_m = 1;
+        int cluster_n = 1;
+
+        if (const auto forced_block_m = get_env<int>("DG_SM90_SWAP_AB_BLOCK_M"); forced_block_m > 0)
+            block_m = forced_block_m;
+        if (const auto forced_block_n = get_env<int>("DG_SM90_SWAP_AB_BLOCK_N"); forced_block_n > 0)
+            block_n = forced_block_n;
+        if (const auto forced_cluster_m = get_env<int>("DG_SM90_SWAP_AB_CLUSTER_M"); forced_cluster_m > 0)
+            cluster_m = forced_cluster_m;
+        if (const auto forced_cluster_n = get_env<int>("DG_SM90_SWAP_AB_CLUSTER_N"); forced_cluster_n > 0)
+            cluster_n = forced_cluster_n;
+
+        if ((block_n != 32 and block_n != 64 and block_n != 128) or
+            (block_m < 8 or block_m > 128 or block_m % 8 != 0) or
+            (block_n == 32 and expected_m != 1) or
+            (cluster_m * cluster_n > 2) or
+            (desc.num_sms % (cluster_m * cluster_n) != 0))
+            return {};
+
+        const int block_k = 128 / get_element_size(desc.get_mma_kind());
+        return {Layout{1, block_m, block_n, block_k, cluster_m, cluster_n}};
+    }
+
+    static std::vector<Layout> get_swap_ab_layout_candidates(const GemmDesc& desc) {
+        if (not is_swap_ab_supported(desc))
+            return {};
+
+        // SM90 swap_ab currently uses two math warpgroups over the original N dimension,
+        // so keep the original D tile N at 128 and let the original M tile vary.
+        constexpr int block_n = 128;
+        const int block_k = 128 / get_element_size(desc.get_mma_kind());
+        const int mk_alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+        const int step = std::lcm(16, heuristics_runtime->get_block_m_multiple_of());
+
+        std::vector<Layout> candidates;
+        for (int cluster_m = 1; cluster_m <= 2; ++ cluster_m) {
+            for (int cluster_n = 1; cluster_n <= 2; ++ cluster_n) {
+                if (cluster_m * cluster_n > 2)
+                    continue;
+                if (desc.num_sms % (cluster_m * cluster_n) != 0)
+                    continue;
+
+                for (int block_m = step; block_m <= std::min(256, mk_alignment); block_m += step) {
+                    if (block_m < 64)
+                        continue;
+                    if (mk_alignment % block_m != 0)
+                        continue;
+                    candidates.push_back(Layout{1, block_m, block_n, block_k, cluster_m, cluster_n});
+                }
+            }
+        }
+        return candidates;
+    }
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         // Block M candidates
@@ -113,6 +201,15 @@ struct SM90ArchSpec {
             }
         }
 
+        if (get_env<int>("DG_SM90_ENABLE_SWAP_AB_CANDIDATES")) {
+            if (desc.get_expected_m() <= 32) {
+                auto normal_swap_ab_candidates = get_normal_swap_ab_layout_candidates(desc);
+                candidates.insert(candidates.end(), normal_swap_ab_candidates.begin(), normal_swap_ab_candidates.end());
+            }
+            auto swap_ab_candidates = get_swap_ab_layout_candidates(desc);
+            candidates.insert(candidates.end(), swap_ab_candidates.begin(), swap_ab_candidates.end());
+        }
+
         DG_HOST_ASSERT(not candidates.empty());
         return candidates;
     }
@@ -121,8 +218,6 @@ struct SM90ArchSpec {
         constexpr int wgmma_m = 64;
 
         // Load/store block sizes (w/o consideration of swizzling atoms, w/ consideration of loop atoms)
-        // TODO: support swap AB
-        DG_HOST_ASSERT(layout.swap_ab == 0);
         const auto load_block_m = layout.block_m;
         const auto load_block_n = layout.block_n;
         // 1D1D kernel will do single warp-group stores
@@ -188,7 +283,8 @@ struct SM90ArchSpec {
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
         const int num_tma_threads = 128;
-        const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
+        const int num_math_threads = layout.swap_ab ? (layout.block_n <= 64 ? 128 : 256) :
+                                     (layout.block_m <= 64 ? 128 : 256);
         return {
             desc.num_sms,
             layout.get_cluster_size(),

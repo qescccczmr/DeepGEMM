@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include "../utils/compatibility.hpp"
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -192,6 +194,11 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        if (std::getenv("DG_SM90_SWAP_AB_NATIVE") != nullptr) {
+            DG_HOST_ASSERT(not use_psum_layout);
+            sm90_m_grouped_fp8_gemm_contiguous_swap_ab(a.first, sfa, b.first, sfb, d, grouped_layout, m, n, k, compiled_dims);
+            return;
+        }
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
