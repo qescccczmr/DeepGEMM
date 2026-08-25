@@ -87,6 +87,16 @@ During the inference decoding phase, when CUDA graph is enabled and the CPU is u
 
 Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
+#### Grouped GEMMs (compact layout, Hopper)
+
+`m_grouped_fp8_gemm_nt_compact` accepts compact `[M, K]` activations and `[M, N]`
+output without `BLOCK_M` padding between experts. Its CUDA int32 `grouped_layout` has
+shape `[G, 2]`; each row is `[start_m, valid_m]`. Starts refer to rows in the compact
+A/D buffers, empty experts are allowed, and the segments must be in bounds and must
+not overlap. The kernel dynamically rebases and bounds the A, SFA, and D TensorMaps;
+TMA OOB handling supplies zero-filled tail loads and discards tail stores. This API is
+currently available only for Hopper FP8 1D2D kernels.
+
 #### V3.2 MQA kernels for the indexer
 
 The kernel family has two versions, non-paged (for prefilling) and paged (for decoding).

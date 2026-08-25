@@ -25,6 +25,7 @@ public:
 
         cute::UMMA::Major major_sfb;
         void *sfb, *grouped_layout;
+        void *gmem_a, *gmem_sfa, *gmem_d, *tensor_map_buffer;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
@@ -72,6 +73,7 @@ static void __instantiate_kernel() {{
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.sfb, args.grouped_layout,
+            args.gmem_a, args.gmem_sfa, args.gmem_d, args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
@@ -134,6 +136,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,
+        .gmem_a = nullptr, .gmem_sfa = nullptr, .gmem_d = nullptr, .tensor_map_buffer = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -152,11 +155,13 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims,
                                                     const bool& use_psum_layout,
-                                                    const std::optional<int>& expected_m_for_psum_layout) {
+                                                    const std::optional<int>& expected_m_for_psum_layout,
+                                                    const bool compact = false,
+                                                    const std::optional<torch::Tensor>& tensor_map_buffer = std::nullopt) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const auto gemm_type = use_psum_layout ?
+    const auto gemm_type = compact ? GemmType::MGroupedCompact : use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
     // Only psum layout can use expected m
@@ -198,7 +203,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                static_cast<int>(d.stride(-2)), 1,
                                                config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, config.layout.block_k, 1, 0);
+                                                 config.layout.block_m + (compact ? 4 : 0),
+                                                 config.layout.block_k, 1, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -211,13 +217,15 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = m_indices.data_ptr(),
+        .gmem_a = a.data_ptr(), .gmem_sfa = sfa.data_ptr(), .gmem_d = d.data_ptr(),
+        .tensor_map_buffer = tensor_map_buffer.has_value() ? tensor_map_buffer->data_ptr() : nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
     };
     const auto code = SM90FP8Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_fp8_gemm_contiguous_1d2d", code);
+    const auto runtime = compiler->build(compact ? "sm90_m_grouped_fp8_gemm_compact_1d2d" : "sm90_m_grouped_fp8_gemm_contiguous_1d2d", code);
     SM90FP8Gemm1D2DRuntime::launch(runtime, args);
 }
 

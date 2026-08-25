@@ -53,6 +53,8 @@ struct Scheduler {
     uint32_t current_group_idx = 0;
     // Only used for masked layout
     uint32_t current_m_cumsum = 0;
+    // Compact M layout stores [start_m, valid_m] for every group.
+    uint32_t current_group_m_start = 0, current_group_m = 0;
     // Only used for contiguous psum layout
     uint32_t last_psum_m = 0, current_psum_m, current_m_block_cumsum = 0;
     // Only used for k-grouped layout
@@ -96,6 +98,8 @@ struct Scheduler {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
+            this->grouped_layout = grouped_layout;
+        } else if constexpr (kGemmType == GemmType::MGroupedCompact) {
             this->grouped_layout = grouped_layout;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             this->grouped_layout = grouped_layout;
@@ -163,6 +167,11 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
+        } else if constexpr (kGemmType == GemmType::MGroupedCompact) {
+            // Compact A/SFA/D are addressed in M coordinates, while B/SFB still
+            // use the expert as their outer group dimension.
+            const auto offset = kWithGroupOffset ? current_group_idx : 0;
+            return offset * shape_dim + block_idx * block_size;
         } else if constexpr (is_k_grouped_contiguous(kGemmType)) {
             auto offset = 0;
             if constexpr (kWithGroupOffset) {
@@ -195,7 +204,25 @@ struct Scheduler {
     }
 
     CUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
+        if constexpr (kGemmType == GemmType::MGroupedCompact) {
+            const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
+            while (true) {
+                if (current_group_idx == kNumGroups)
+                    return false;
+                current_group_m_start = static_cast<uint32_t>(grouped_layout[current_group_idx * 2]);
+                current_group_m = static_cast<uint32_t>(grouped_layout[current_group_idx * 2 + 1]);
+                num_m_blocks = math::ceil_div(current_group_m, BLOCK_M);
+                const auto next_m_block_cumsum = current_m_cumsum + num_m_blocks;
+                if (next_block_idx < next_m_block_cumsum * num_n_blocks) {
+                    get_swizzled_block_idx(next_block_idx - current_m_cumsum * num_n_blocks,
+                                            m_block_idx, n_block_idx);
+                    return true;
+                }
+                ++ current_group_idx;
+                current_m_cumsum = next_m_block_cumsum;
+            }
+        } else {
+            const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
             while (true) {
@@ -284,24 +311,29 @@ struct Scheduler {
             get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
         }
         return true;
+        }
     }
 
     // For SM90 only
     CUTLASS_DEVICE bool is_tma_multicast_valid(const uint32_t& m_block_idx) const {
-        if (num_blocks_in_group == 1)
+        if constexpr (kGemmType == GemmType::MGroupedCompact) {
             return false;
-        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedMasked or
-                      is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
-                      kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
-            return true;
         } else {
-            DG_STATIC_ASSERT(kGemmType == GemmType::MGroupedContiguous, "Invalid Gemm type");
-            if constexpr (kIsMulticastOnA) {
+            if (num_blocks_in_group == 1)
+                return false;
+            if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedMasked or
+                          is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
+                          kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
                 return true;
             } else {
-                const auto group_idx = grouped_layout[m_block_idx * BLOCK_M];
-                const auto peer_group_idx = grouped_layout[(m_block_idx ^ 1) * BLOCK_M];
-                return group_idx == peer_group_idx;
+                DG_STATIC_ASSERT(kGemmType == GemmType::MGroupedContiguous, "Invalid Gemm type");
+                if constexpr (kIsMulticastOnA) {
+                    return true;
+                } else {
+                    const auto group_idx = grouped_layout[m_block_idx * BLOCK_M];
+                    const auto peer_group_idx = grouped_layout[(m_block_idx ^ 1) * BLOCK_M];
+                    return group_idx == peer_group_idx;
+                }
             }
         }
     }
@@ -317,6 +349,8 @@ struct Scheduler {
             return m_offset + m_block_idx * BLOCK_M < grouped_layout[current_group_idx];
         } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             return m_offset + m_block_idx * BLOCK_M < current_psum_m;
+        } else if constexpr (kGemmType == GemmType::MGroupedCompact) {
+            return m_offset + m_block_idx * BLOCK_M < current_group_m;
         } else {
             // Unreachable 
             DG_TRAP_ONLY_DEVICE_ASSERT(false);

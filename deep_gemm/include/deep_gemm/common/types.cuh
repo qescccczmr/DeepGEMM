@@ -25,6 +25,7 @@ enum class GemmType {
     Batched                             = 4,
     MGroupedContiguousWithPsumLayout    = 5,
     KGroupedContiguousWithPsumLayout    = 6,
+    MGroupedCompact                     = 7,
 };
 
 constexpr CUTLASS_HOST_DEVICE bool is_m_grouped_contiguous(const GemmType& gemm_type) {

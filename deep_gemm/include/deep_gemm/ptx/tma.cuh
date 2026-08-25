@@ -31,6 +31,15 @@ CUTLASS_DEVICE void tensor_map_replace_global_inner_dim_stride_in_smem(cute::Tma
 #endif
 }
 
+template <uint32_t kDim>
+CUTLASS_DEVICE void tensor_map_replace_global_dim_in_smem(cute::TmaDescriptor* smem_desc,
+                                                           const uint32_t& new_size) {
+    DG_STATIC_ASSERT(kDim < 5, "Invalid TensorMap dimension");
+    auto smem_int_desc = __cvta_generic_to_shared(smem_desc);
+    asm volatile ("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;"
+                  :: "l"(smem_int_desc), "n"(kDim), "r"(new_size));
+}
+
 /// TMA instructions
 CUTLASS_DEVICE void mbarrier_arrive(
     cutlass::arch::ClusterTransactionBarrier* ptr) {

@@ -18,6 +18,7 @@
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
@@ -48,6 +49,8 @@ template <cute::UMMA::Major kMajorSFB,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+                        const __nv_fp8_e4m3* gmem_a, const float* gmem_sfa,
+                        __nv_bfloat16* gmem_d, cute::TmaDescriptor* tensor_map_buffer,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -75,10 +78,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Shared memory
     static constexpr bool kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
+    // Keep D/A's swizzle base 1024-byte aligned after the descriptors.
+    static constexpr uint32_t SMEM_TENSOR_MAP_SIZE = kGemmType == GemmType::MGroupedCompact ? 1024 : 0;
     static constexpr uint32_t SMEM_D_SIZE = math::constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(__nv_bfloat16)), 1024u);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
-    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
+    static constexpr uint32_t TMA_SFA_ELEMS = kGemmType == GemmType::MGroupedCompact ? BLOCK_M + 4 : BLOCK_M;
+    static constexpr uint32_t TMA_SFA_SIZE_PER_STAGE = TMA_SFA_ELEMS * sizeof(float);
+    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = TMA_SFA_SIZE_PER_STAGE;
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
     const uint32_t shape_k_scales = math::ceil_div(shape_k, BLOCK_K);
     const uint32_t shape_n_sfb = math::ceil_div(shape_n, BLOCK_K);
@@ -107,14 +114,21 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
-    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
+    auto smem_tensor_map_a = reinterpret_cast<cute::TmaDescriptor*>(smem_buffer);
+    auto smem_tensor_map_sfa = smem_tensor_map_a + 1;
+    auto smem_tensor_map_d = smem_tensor_map_a + 2;
+    auto gmem_tensor_map_a = tensor_map_buffer + blockIdx.x * 3;
+    auto gmem_tensor_map_sfa = gmem_tensor_map_a + 1;
+    auto gmem_tensor_map_d = gmem_tensor_map_a + 2;
+
+    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
     auto smem_a = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
     });
     auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
     });
-    constexpr uint32_t SMEM_SF_OFFSET = SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    constexpr uint32_t SMEM_SF_OFFSET = SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
@@ -128,6 +142,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // Initialize barriers
     DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
     if (warp_idx == kNumMathThreads / 32 + 1 and cute::elect_one_sync()) {
+        if constexpr (kGemmType == GemmType::MGroupedCompact) {
+            *smem_tensor_map_a = tensor_map_a;
+            *smem_tensor_map_sfa = tensor_map_sfa;
+            *smem_tensor_map_d = tensor_map_d;
+        }
         // NOTES: we always use `lane_idx` to arrive for the `lane_idx`-th CTA in the cluster,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
@@ -171,8 +190,32 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // NOTES: only one thread (or warp) will be used
         // We use the third warp, as warp 0/1 may be doing WGMMA with `BLOCK_M == 32`
         if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
+            uint32_t descriptor_group_idx = kNumGroups;
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if constexpr (kGemmType == GemmType::MGroupedCompact) {
+                    if (descriptor_group_idx != scheduler.current_group_idx) {
+                        descriptor_group_idx = scheduler.current_group_idx;
+                        const auto start = scheduler.current_group_m_start;
+                        const auto lead = start & 3u;
+                        ptx::tensor_map_replace_global_addr_in_smem(
+                            smem_tensor_map_a, gmem_a + start * shape_k);
+                        ptx::tensor_map_replace_global_dim_in_smem<1>(
+                            smem_tensor_map_a, scheduler.current_group_m);
+                        ptx::tensor_map_replace_global_addr_in_smem(
+                            smem_tensor_map_sfa, gmem_sfa + start - lead);
+                        ptx::tensor_map_replace_global_dim_in_smem<0>(
+                            smem_tensor_map_sfa, math::align(scheduler.current_group_m + lead, 4u));
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        __syncwarp(1u << lane_idx);
+                        *gmem_tensor_map_a = *smem_tensor_map_a;
+                        *gmem_tensor_map_sfa = *smem_tensor_map_sfa;
+                        ptx::tensor_map_release_gpu();
+                        ptx::tensor_map_acquire_gpu(gmem_tensor_map_a);
+                        ptx::tensor_map_acquire_gpu(gmem_tensor_map_sfa);
+                    }
+                }
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
@@ -191,10 +234,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_a, &full_barrier,
+                    const auto tensor_map_a_ptr = kGemmType == GemmType::MGroupedCompact ?
+                        gmem_tensor_map_a : &tensor_map_a;
+                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(tensor_map_a_ptr, &full_barrier,
                              smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
                              num_tma_multicast_a, batch_idx);
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
+                    const auto tensor_map_sfa_ptr = kGemmType == GemmType::MGroupedCompact ?
+                        gmem_tensor_map_sfa : &tensor_map_sfa;
+                    tma::copy<TMA_SFA_ELEMS, BLOCK_K, 0>(tensor_map_sfa_ptr, &full_barrier,
                              smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx),
                              num_tma_multicast_a);
 
@@ -202,7 +249,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
                              smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b, batch_idx);
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + TMA_SFA_SIZE_PER_STAGE);
                 }
             }
 
@@ -224,9 +271,28 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         auto b_desc = mma::sm90::make_smem_desc(smem_b[0], 1);
         const uint32_t a_desc_lo = __shfl_sync(0xffffffff, a_desc.reg32_[0], 0);
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
+        uint32_t descriptor_group_idx = kNumGroups;
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            if constexpr (kGemmType == GemmType::MGroupedCompact) {
+                if (descriptor_group_idx != scheduler.current_group_idx) {
+                    // Keep the descriptor immutable until the previous store has
+                    // consumed it. This also avoids store/load engine contention.
+                    cute::tma_store_wait<0>();
+                    if (threadIdx.x == 0) {
+                        descriptor_group_idx = scheduler.current_group_idx;
+                        const auto start = scheduler.current_group_m_start;
+                        ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_d, gmem_d + start * shape_n);
+                        ptx::tensor_map_replace_global_dim_in_smem<1>(smem_tensor_map_d, scheduler.current_group_m);
+                        *gmem_tensor_map_d = *smem_tensor_map_d;
+                        ptx::tensor_map_release_gpu();
+                        ptx::tensor_map_acquire_gpu(gmem_tensor_map_d);
+                    }
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 2);
+                    descriptor_group_idx = scheduler.current_group_idx;
+                }
+            }
             // Decide the number of scales B to load
             DG_TRAP_ONLY_DEVICE_ASSERT(shape_n % 8 == 0);
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -300,8 +366,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                             // Read A scales
                             // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                            auto scale_a_0 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_0 + m_offset) : 0;
-                            auto scale_a_1 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_1 + m_offset) : 0;
+                            const uint32_t sfa_lead = kGemmType == GemmType::MGroupedCompact ?
+                                (scheduler.current_group_m_start & 3u) : 0;
+                            auto scale_a_0 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + sfa_lead + r_0 + m_offset) : 0;
+                            auto scale_a_1 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + sfa_lead + r_1 + m_offset) : 0;
 
                             // Commit WGMMA instructions
                             #pragma unroll
@@ -436,7 +504,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
                                                   n_idx, m_idx, scheduler.current_group_idx);
                 } else {
-                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+                    const auto tensor_map_d_ptr = kGemmType == GemmType::MGroupedCompact ? gmem_tensor_map_d : &tensor_map_d;
+                    cute::SM90_TMA_STORE_2D::copy(tensor_map_d_ptr, smem_ptr, n_idx, m_idx);
                 }
                 cute::tma_store_arrive();
             }

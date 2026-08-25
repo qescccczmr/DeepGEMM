@@ -247,6 +247,55 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                          use_psum_layout, ensure_zero_padding, std::nullopt);
 }
 
+// Hopper-only compact M-grouped GEMM. `grouped_layout[g]` is
+// `[start_m, valid_m]`; A/SFA/D contain exactly the concatenated valid rows.
+static void m_grouped_fp8_fp4_gemm_nt_compact(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                              const std::pair<torch::Tensor, torch::Tensor>& b,
+                                              const torch::Tensor& d,
+                                              const torch::Tensor& grouped_layout,
+                                              std::optional<std::tuple<int, int, int>> recipe,
+                                              std::optional<std::tuple<int, int>> recipe_a,
+                                              std::optional<std::tuple<int, int>> recipe_b,
+                                              const std::string& compiled_dims,
+                                              const bool& disable_ue8m0_cast,
+                                              const std::optional<torch::Tensor>& workspace) {
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous() and grouped_layout.scalar_type() == torch::kInt);
+    const auto [m, k] = check_ab_fp8_fp4(a.first, major_a, 9);
+    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, 9);
+    const auto [m_, n_] = get_shape<2>(d);
+    const auto [layout_groups, layout_fields] = get_shape<2>(grouped_layout);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(layout_groups == num_groups and layout_fields == 2);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    check_major_type_cd(d);
+    if (m == 0)
+        return;
+
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt,
+        num_groups, disable_ue8m0_cast, std::nullopt);
+    (void)gran_k_a, (void)gran_k_b;
+
+    // One private A/SFA/D descriptor triplet per persistent CTA.
+    const auto required_workspace_bytes =
+        device_runtime->get_num_sms() * 3 * static_cast<int>(sizeof(CUtensorMap));
+    const auto tensor_map_buffer = workspace.has_value() ? workspace.value() : torch::empty(
+        {required_workspace_bytes}, a.first.options().dtype(torch::kByte));
+    DG_HOST_ASSERT(tensor_map_buffer.is_cuda() and tensor_map_buffer.is_contiguous());
+    DG_HOST_ASSERT(tensor_map_buffer.scalar_type() == torch::kByte);
+    DG_HOST_ASSERT(tensor_map_buffer.numel() >= required_workspace_bytes);
+    const auto major_sfb = get_major_type_ab(sfb);
+    sm90_m_grouped_fp8_gemm_contiguous_1d2d(
+        a.first, sfa, b.first, sfb, d, grouped_layout, num_groups, m, n, k,
+        major_a, major_b, major_sfb, compiled_dims, false, std::nullopt, true,
+        tensor_map_buffer);
+}
+
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
@@ -687,6 +736,13 @@ static void register_apis(pybind11::module_& m) {
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true);
+    m.def("m_grouped_fp8_fp4_gemm_nt_compact", &m_grouped_fp8_fp4_gemm_nt_compact,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
+          py::arg("recipe") = std::nullopt,
+          py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("workspace") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nt_masked", &m_grouped_fp8_fp4_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
@@ -714,6 +770,7 @@ static void register_apis(pybind11::module_& m) {
     m.attr("fp8_gemm_tt") = m.attr("fp8_fp4_gemm_tt");
     m.attr("m_grouped_fp8_gemm_nt_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous");
     m.attr("m_grouped_fp8_gemm_nn_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nn_contiguous");
+    m.attr("m_grouped_fp8_gemm_nt_compact") = m.attr("m_grouped_fp8_fp4_gemm_nt_compact");
     m.attr("m_grouped_fp8_gemm_nt_masked") = m.attr("m_grouped_fp8_fp4_gemm_nt_masked");
 #endif
 

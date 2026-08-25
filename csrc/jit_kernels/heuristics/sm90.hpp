@@ -33,6 +33,9 @@ struct SM90ArchSpec {
             block_m_candidates = std::vector{heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
         } else if (desc.gemm_type == GemmType::MGroupedMasked) {
             block_m_candidates = {64, 128};
+        } else if (desc.gemm_type == GemmType::MGroupedCompact) {
+            block_m_candidates = desc.m <= desc.num_groups * 32 ?
+                std::vector<int>{64} : std::vector<int>{64, 128};
         }
 
         // Block N candidates
@@ -64,7 +67,8 @@ struct SM90ArchSpec {
             // The number of k-groups is large (a heuristic)
             (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
             // Not supported
-            (desc.gemm_type == GemmType::Batched);
+            (desc.gemm_type == GemmType::Batched) or
+            (desc.gemm_type == GemmType::MGroupedCompact);
 
         // Enumerate all candidates
         std::vector<Layout> candidates;
@@ -86,7 +90,8 @@ struct SM90ArchSpec {
 
                         // Multicast legality for masked layout
                         // TODO: add some comments about it
-                        if ((desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) and
+                        if ((desc.gemm_type == GemmType::MGroupedMasked or
+                             desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) and
                             ceil_div(desc.n, block_n) % (cluster_m * cluster_n) != 0)
                             continue;
 
@@ -160,8 +165,9 @@ struct SM90ArchSpec {
         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
 
         // Calculate SF A/B per stages
+        const int compact_sfa_rows = desc.gemm_type == GemmType::MGroupedCompact ? 4 : 0;
         const int smem_sfa_per_stage = desc.kernel_type == KernelType::KernelNoSF ?
-            0 : align(layout.block_m * static_cast<int>(sizeof(float)), 128);
+            0 : align((layout.block_m + compact_sfa_rows) * static_cast<int>(sizeof(float)), 128);
         const int smem_sfb_per_stage = desc.kernel_type != KernelType::Kernel1D1D ?
             0 : align(layout.block_n * static_cast<int>(sizeof(float)), 128);
 
@@ -172,7 +178,8 @@ struct SM90ArchSpec {
 
         // Extra tensormap for 1D1D kernels
         const int smem_tensormap =
-            desc.gemm_type == GemmType::KGroupedContiguous ? 4 * static_cast<int>(sizeof(CUtensorMap)) : 0;
+            desc.gemm_type == GemmType::KGroupedContiguous ? 4 * static_cast<int>(sizeof(CUtensorMap)) :
+            desc.gemm_type == GemmType::MGroupedCompact ? 1024 : 0;
 
         // Calculate stages
         const int smem_extra = smem_cd + smem_barriers + smem_extra_sfb + smem_tensormap;
